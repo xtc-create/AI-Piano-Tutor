@@ -15,6 +15,7 @@ type Account = { id: string; name: string; email: string; password: string; hist
 type SoundName = 'Concert Grand' | 'Electric Piano' | 'Organ' | 'Harpsichord'
 type LessonStep = { note: string; time: number }
 type Piece = { id: string; title: string; composer: string; difficulty: 'Beginner' | 'Easy' | 'Intermediate'; steps: LessonStep[] }
+type LessonResult = { correct: number; total: number; averageLatency: number; lateNotes: number; wrongNotes: number }
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 const WHITE_NAMES = new Set(['C', 'D', 'E', 'F', 'G', 'A', 'B'])
@@ -49,14 +50,27 @@ function isWhite(note: string) {
 
 export default function PianoTutorApp() {
   const [account, setAccount] = useState<Account | null>(null)
-  const [screen, setScreen] = useState<'dashboard' | 'practice'>('dashboard')
+  const [path, setPath] = useState('/')
   const guestHistoryRef = useRef<Sequence[]>([])
+
+  const navigate = useCallback((nextPath: string) => {
+    window.history.pushState({}, '', nextPath)
+    setPath(nextPath)
+  }, [])
+
+  useEffect(() => {
+    setPath(window.location.pathname)
+    const onPopState = () => setPath(window.location.pathname)
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
 
   useEffect(() => {
     const savedId = localStorage.getItem('piano-tutor-current-account')
     const accounts: Account[] = JSON.parse(localStorage.getItem('piano-tutor-accounts') ?? '[]')
     const saved = accounts.find((item) => item.id === savedId)
     if (saved) setAccount(saved)
+    else if (window.location.pathname === '/practice') setAccount({ id: 'guest', name: 'Guest player', email: '', password: '', history: [], xp: 0, streak: 0, joined_at: new Date().toISOString(), guest: true })
   }, [])
 
   const saveAccount = useCallback((next: Account) => {
@@ -74,10 +88,12 @@ export default function PianoTutorApp() {
     localStorage.setItem('piano-tutor-current-account', resolved.id)
   }, [])
 
-  const signOut = () => { if (account?.guest) guestHistoryRef.current = account.history; localStorage.removeItem('piano-tutor-current-account'); setAccount(null); setScreen('dashboard') }
-  if (!account) return <AuthScreen onAuthenticated={saveAccount} onTryGuest={() => setAccount({ id: 'guest', name: 'Guest player', email: '', password: '', history: guestHistoryRef.current, xp: guestHistoryRef.current.length * 25, streak: 0, joined_at: new Date().toISOString(), guest: true })} />
-  if (screen === 'practice') return <PianoTutor account={account} onExit={() => setScreen('dashboard')} onHistoryChange={(history) => saveAccount({ ...account, history, xp: account.xp + (history.length > account.history.length ? 25 : 0) })} />
-  return <Dashboard account={account} onPractice={() => setScreen('practice')} onSignOut={signOut} />
+  const signOut = () => { if (account?.guest) guestHistoryRef.current = account.history; localStorage.removeItem('piano-tutor-current-account'); setAccount(null); navigate('/login') }
+  const beginMidiSetup = (next: Account) => { saveAccount(next); navigate('/midi-setup') }
+  if (!account) return <AuthScreen registering={path === '/signup'} onNavigate={navigate} onAuthenticated={beginMidiSetup} onTryGuest={() => beginMidiSetup({ id: 'guest', name: 'Guest player', email: '', password: '', history: guestHistoryRef.current, xp: guestHistoryRef.current.length * 25, streak: 0, joined_at: new Date().toISOString(), guest: true })} />
+  if (path === '/midi-setup') return <MidiSetupScreen onDone={() => navigate('/dashboard')} />
+  if (path === '/practice') return <PianoTutor account={account} onExit={() => navigate('/dashboard')} onHistoryChange={(history) => saveAccount({ ...account, history, xp: account.xp + (history.length > account.history.length ? 25 : 0) })} />
+  return <Dashboard account={account} onPractice={() => navigate('/practice')} onSignOut={signOut} />
 }
 
 function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; onExit: () => void; onHistoryChange: (history: Sequence[]) => void }) {
@@ -90,6 +106,9 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
   const [selectedPieceId, setSelectedPieceId] = useState(PIECES[0].id)
   const [lessonProgress, setLessonProgress] = useState(0)
   const [lessonFeedback, setLessonFeedback] = useState('Choose a piece, then start the lesson. Your timing is measured against each expected note.')
+  const [lessonActive, setLessonActive] = useState(false)
+  const [lessonClock, setLessonClock] = useState(0)
+  const [lessonResult, setLessonResult] = useState<LessonResult | null>(null)
   const [aiFeedback, setAiFeedback] = useState('')
   const [aiLoading, setAiLoading] = useState(false)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -104,7 +123,7 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
   const pianoRef = useRef<HTMLDivElement | null>(null)
   const keyRefs = useRef(new Map<string, HTMLButtonElement>())
   const lastSharedHistoryRef = useRef(JSON.stringify(account.history))
-  const lessonRef = useRef<{ piece: Piece; startedAt: number; index: number; latencies: number[] } | null>(null)
+  const lessonRef = useRef<{ piece: Piece; startedAt: number; index: number; latencies: number[]; wrongNotes: number } | null>(null)
 
   useEffect(() => {
     const encoded = JSON.stringify(sequences)
@@ -176,10 +195,12 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
         if (lesson.index === lesson.piece.steps.length) {
           const average = lesson.latencies.reduce((total, value) => total + value, 0) / lesson.latencies.length
           const late = lesson.latencies.filter((value) => value > 120).length
-          setLessonFeedback(`Finished: average timing ${Math.round(Math.abs(average))} ms ${average > 0 ? 'late' : 'early'}; ${late} of ${lesson.latencies.length} notes were more than 120 ms late. Generate AI feedback for a practice explanation.`)
+          const result = { correct: lesson.latencies.length, total: lesson.piece.steps.length, averageLatency: average, lateNotes: late, wrongNotes: lesson.wrongNotes }
+          setLessonResult(result); setLessonActive(false)
+          setLessonFeedback(`Finished: ${Math.round((result.correct / (result.correct + result.wrongNotes)) * 100)}% note accuracy. Average timing ${Math.round(Math.abs(average))} ms ${average > 0 ? 'late' : 'early'}; ${late} notes were more than 120 ms late.`)
           lessonRef.current = null
         } else setLessonFeedback(`${Math.round(Math.abs(latency))} ms ${latency >= 0 ? 'late' : 'early'} — next note: ${lesson.piece.steps[lesson.index].note}`)
-      } else setLessonFeedback(`Expected ${step?.note}; you played ${note}. Try the highlighted next note.`)
+      } else { lesson.wrongNotes += 1; setLessonFeedback(`Expected ${step?.note}; you played ${note}. Try the highlighted next note.`) }
     }
   }, [addParticle, capture, ensureAudio, sound])
 
@@ -218,6 +239,12 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
     window.addEventListener('keyup', onKeyUp)
     return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp) }
   }, [handleNoteOff, handleNoteOn])
+
+  useEffect(() => {
+    if (!lessonActive) return
+    const timer = window.setInterval(() => setLessonClock(performance.now()), 50)
+    return () => window.clearInterval(timer)
+  }, [lessonActive])
 
   useEffect(() => {
     let animationFrame = 0
@@ -287,14 +314,14 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
 
   const startLesson = useCallback(() => {
     const piece = PIECES.find((item) => item.id === selectedPieceId) ?? PIECES[0]
-    lessonRef.current = { piece, startedAt: performance.now(), index: 0, latencies: [] }
-    setLessonProgress(0); setAiFeedback(''); setLessonFeedback(`Lesson started. Play ${piece.steps[0].note} now, then follow the next-note prompt.`)
+    lessonRef.current = { piece, startedAt: performance.now() + 1800, index: 0, latencies: [], wrongNotes: 0 }
+    setLessonProgress(0); setLessonResult(null); setAiFeedback(''); setLessonActive(true); setLessonClock(performance.now()); setLessonFeedback('Get ready… the first note reaches the timing line in 3, 2, 1.')
   }, [selectedPieceId])
 
   const requestAiFeedback = useCallback(async () => {
     setAiLoading(true); setAiFeedback('')
     try {
-      const response = await fetch('/api/coach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lessonFeedback, piece: PIECES.find((item) => item.id === selectedPieceId)?.title }) })
+      const response = await fetch('/api/coach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lessonFeedback, lessonResult, piece: PIECES.find((item) => item.id === selectedPieceId)?.title }) })
       const payload = await response.json() as { feedback?: string; error?: string }
       if (!response.ok) throw new Error(payload.error ?? 'AI feedback failed')
       setAiFeedback(payload.feedback ?? '')
@@ -333,12 +360,16 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
   }
   void persistSequenceToSupabase
 
+  const selectedPiece = PIECES.find((piece) => piece.id === selectedPieceId) ?? PIECES[0]
+  const lessonNotes = Array.from(new Set(selectedPiece.steps.map((step) => step.note)))
+  const lessonStart = lessonRef.current?.startedAt ?? 0
+  const elapsed = lessonActive ? lessonClock - lessonStart : 0
+
   return (
     <main style={{ minHeight: '100vh', background: '#161616', color: '#f0ece5', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', padding: '42px 20px' }}>
       <div style={{ maxWidth: 1000, margin: '0 auto' }}>
         <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 20, marginBottom: 28, flexWrap: 'wrap' }}>
           <div><button onClick={onExit} style={{ ...buttonStyle, padding: '5px 8px', marginBottom: 11 }}>← Dashboard</button><p style={{ color: '#c5a36a', fontSize: 12, fontWeight: 700, letterSpacing: '0.14em', margin: '0 0 8px', fontFamily: 'Arial, sans-serif' }}>LIVE INSTRUMENT · {account.name.toUpperCase()}</p><h1 style={{ margin: 0, fontSize: 34 }}>Piano tutor</h1></div>
-          <button onClick={connectMidi} style={buttonStyle}>{midiStatus.startsWith('MIDI is') ? 'Connect MIDI device' : midiStatus}</button>
         </header>
         <section style={{ ...panelStyle, marginBottom: 18 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14, flexWrap: 'wrap', alignItems: 'center' }}><div><p style={{ margin: 0, color: '#a8a8a8', fontSize: 12, fontFamily: 'Arial, sans-serif', letterSpacing: '.12em' }}>SOUNDS</p><h2 style={{ margin: '5px 0 0', fontSize: 20 }}>Choose your instrument</h2></div><div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>{(['Concert Grand', 'Electric Piano', 'Organ', 'Harpsichord'] as SoundName[]).map((name) => <button key={name} onClick={() => setSound(name)} style={{ ...buttonStyle, background: sound === name ? '#e6e6e6' : '#303030', color: sound === name ? '#101010' : '#eeeeee', borderColor: sound === name ? '#ffffff' : '#555555' }}>{name}</button>)}</div></div>
@@ -346,12 +377,18 @@ function PianoTutor({ account, onExit, onHistoryChange }: { account: Account; on
         <section style={{ ...panelStyle, marginBottom: 18 }}>
           <div style={{ display: 'flex', alignItems: 'end', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}><div><p style={{ margin: 0, color: '#a8a8a8', fontSize: 12, fontFamily: 'Arial, sans-serif', letterSpacing: '.12em' }}>LEARN A PIECE</p><h2 style={{ margin: '5px 0 0', fontSize: 20 }}>Guided timing lesson</h2></div><button onClick={startLesson} style={{ ...buttonStyle, background: '#f0f0f0', color: '#111', borderColor: '#fff' }}>Start lesson</button></div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 9, marginTop: 14 }}>{PIECES.map((piece) => <button key={piece.id} onClick={() => { setSelectedPieceId(piece.id); setLessonProgress(0); setAiFeedback(''); setLessonFeedback(`${piece.title} selected. Difficulty: ${piece.difficulty}.`) }} style={{ textAlign: 'left', ...buttonStyle, padding: 13, background: selectedPieceId === piece.id ? '#eeeeee' : '#1d1d1d', color: selectedPieceId === piece.id ? '#111' : '#eee', borderColor: selectedPieceId === piece.id ? '#fff' : '#4d4d4d' }}><strong>{piece.title}</strong><span style={{ display: 'block', marginTop: 4, fontSize: 12, opacity: .72 }}>{piece.composer} · {piece.difficulty}</span></button>)}</div>
-          <div style={{ marginTop: 13, padding: 12, background: '#181818', border: '1px solid #3d3d3d', borderRadius: 8, fontFamily: 'Arial, sans-serif', fontSize: 13, color: '#d5d5d5' }}><b>{lessonProgress}/{(PIECES.find((piece) => piece.id === selectedPieceId)?.steps.length ?? 0)} notes</b> · {lessonFeedback}</div>
-          <button onClick={requestAiFeedback} disabled={aiLoading} style={{ ...buttonStyle, marginTop: 10, opacity: aiLoading ? .6 : 1 }}>{aiLoading ? 'Analysing timing…' : 'Get AI timing insight'}</button>{aiFeedback && <p style={{ fontFamily: 'Arial, sans-serif', fontSize: 13, color: '#dedede', lineHeight: 1.5 }}>{aiFeedback}</p>}
+          <div style={{ marginTop: 13, padding: 12, background: '#181818', border: '1px solid #3d3d3d', borderRadius: 8, fontFamily: 'Arial, sans-serif', fontSize: 13, color: '#d5d5d5' }}><b>{lessonProgress}/{selectedPiece.steps.length} notes</b> · {lessonFeedback}</div>
+          {lessonResult && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10, fontFamily: 'Arial, sans-serif' }}><span style={metricStyle}>Accuracy {Math.round((lessonResult.correct / (lessonResult.correct + lessonResult.wrongNotes)) * 100)}%</span><span style={metricStyle}>Average {Math.round(Math.abs(lessonResult.averageLatency))} ms {lessonResult.averageLatency >= 0 ? 'late' : 'early'}</span><span style={metricStyle}>{lessonResult.lateNotes} late notes</span></div>}
+          <button onClick={requestAiFeedback} disabled={aiLoading || !lessonResult} style={{ ...buttonStyle, marginTop: 10, opacity: aiLoading || !lessonResult ? .6 : 1 }}>{aiLoading ? 'Analysing timing…' : 'Get AI timing insight'}</button>{aiFeedback && <p style={{ fontFamily: 'Arial, sans-serif', fontSize: 13, color: '#dedede', lineHeight: 1.5 }}>{aiFeedback}</p>}
         </section>
         <section style={panelStyle}>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 15, color: '#a5adbd', fontSize: 13 }}><span>C4 — B5 · click, type, or connect a controller</span><span>{activeNotes.size ? `${activeNotes.size} note${activeNotes.size > 1 ? 's' : ''} playing` : 'Ready'}</span></div>
           <div ref={pianoRef} style={{ position: 'relative', height: 510, borderRadius: 8, overflow: 'hidden', background: 'linear-gradient(#242424, #161616 58%)', touchAction: 'none' }}>
+            {lessonActive && <div style={{ position: 'absolute', inset: 0, zIndex: 1, pointerEvents: 'none', overflow: 'hidden' }}>
+              <div style={{ position: 'absolute', top: 0, left: '27%', width: '46%', bottom: 278, display: 'grid', gridTemplateColumns: `repeat(${lessonNotes.length}, 1fr)` }}>{lessonNotes.map((note) => <div key={note} style={{ borderRight: '1px solid #ffffff12', display: 'flex', justifyContent: 'center', alignItems: 'end', paddingBottom: 7, color: '#aaa', fontSize: 11, fontFamily: 'Arial, sans-serif' }}>{note}</div>)}</div>
+              <div style={{ position: 'absolute', top: 226, left: '27%', width: '46%', height: 3, background: '#f2f2f2', boxShadow: '0 0 12px #fff8' }} />
+              {selectedPiece.steps.map((step, index) => { const lane = lessonNotes.indexOf(step.note); const y = 226 - (step.time - elapsed) * .13; if (y < -28 || y > 250) return null; return <div key={`${index}-${step.note}`} style={{ position: 'absolute', zIndex: 2, top: y, left: `calc(27% + ${(lane / lessonNotes.length) * 46}% + 4px)`, width: `calc(${46 / lessonNotes.length}% - 8px)`, height: 24, borderRadius: 5, background: index === lessonProgress ? '#f5f5f5' : '#8b8b8b', color: '#111', display: 'grid', placeItems: 'center', fontSize: 11, fontWeight: 700, fontFamily: 'Arial, sans-serif', boxShadow: index === lessonProgress ? '0 0 16px #fff8' : 'none' }}>{step.note}</div> })}
+            </div>}
             <canvas ref={canvasRef} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 3 }} />
             <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 278, display: 'flex', zIndex: 2 }}>
               {WHITE_NOTES.map((note) => <button key={note} ref={(node) => { if (node) keyRefs.current.set(note, node) }} aria-label={note} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); handleNoteOn(note, 110, 'mouse') }} onPointerUp={() => handleNoteOff(note, 'mouse')} onPointerLeave={() => handleNoteOff(note, 'mouse')} style={{ ...whiteKeyStyle, background: activeNotes.has(note) ? '#e6d5b8' : '#eee9df' }}>{note}</button>)}
@@ -375,9 +412,9 @@ const panelStyle = { background: '#252422', border: '1px solid #4b4842', borderR
 const buttonStyle = { border: '1px solid #5b564e', background: '#353330', color: '#eee8de', borderRadius: 8, padding: '9px 12px', fontSize: 13, cursor: 'pointer', fontFamily: 'Arial, sans-serif' }
 const whiteKeyStyle = { flex: 1, minWidth: 0, border: '1px solid #858585', borderBottom: 0, borderRadius: '0 0 4px 4px', color: '#3b3b3b', fontSize: 10, paddingTop: 230, cursor: 'pointer', boxShadow: 'inset 0 -12px 18px #0002' }
 const blackKeyStyle = { position: 'absolute' as const, zIndex: 4, bottom: 128, width: '2.3%', height: 178, border: '1px solid #000', borderRadius: '0 0 4px 4px', color: '#e6e6e6', fontSize: 9, cursor: 'pointer', boxShadow: '0 4px 6px #000a' }
+const metricStyle = { background: '#eeeeee', color: '#171717', borderRadius: 5, padding: '6px 8px', fontSize: 12 }
 
-function AuthScreen({ onAuthenticated, onTryGuest }: { onAuthenticated: (account: Account) => void; onTryGuest: () => void }) {
-  const [registering, setRegistering] = useState(false)
+function AuthScreen({ registering, onNavigate, onAuthenticated, onTryGuest }: { registering: boolean; onNavigate: (path: string) => void; onAuthenticated: (account: Account) => void; onTryGuest: () => void }) {
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -402,10 +439,29 @@ function AuthScreen({ onAuthenticated, onTryGuest }: { onAuthenticated: (account
       <label style={labelStyle}>Email<input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} style={inputStyle} placeholder="you@example.com" /></label>
       <label style={labelStyle}>Password<input required type="password" minLength={4} value={password} onChange={(event) => setPassword(event.target.value)} style={inputStyle} placeholder="••••••••" /></label>
       {error && <p style={{ color: '#e6a29a', fontSize: 13 }}>{error}</p>}<button style={{ ...buttonStyle, width: '100%', background: '#6f5c3e', marginTop: 10 }} type="submit">{registering ? 'Create account' : 'Sign in'}</button>
-      <button type="button" onClick={() => { setRegistering(!registering); setError('') }} style={{ ...buttonStyle, border: 0, width: '100%', marginTop: 8 }}>{registering ? 'I already have an account' : 'Create an account'}</button>
+      <button type="button" onClick={() => { setError(''); onNavigate(registering ? '/login' : '/signup') }} style={{ ...buttonStyle, border: 0, width: '100%', marginTop: 8 }}>{registering ? 'I already have an account' : 'Create an account'}</button>
       <button type="button" onClick={onTryGuest} style={{ ...buttonStyle, width: '100%', marginTop: 17, borderColor: '#7c6b4d', color: '#e3cd9d' }}>Try the piano without an account</button>
       <p style={{ color: '#928b80', fontSize: 11, lineHeight: 1.45, marginTop: 14, fontFamily: 'Arial, sans-serif' }}>Guest sessions work immediately but are not saved after you leave. Signed-in accounts are stored only in this browser for now.</p>
     </form>
+  </main>
+}
+
+function MidiSetupScreen({ onDone }: { onDone: () => void }) {
+  const [status, setStatus] = useState('Connect a MIDI keyboard for the best lesson timing.')
+  const [connecting, setConnecting] = useState(false)
+  const connect = async () => {
+    const requestMidi = (navigator as Navigator & { requestMIDIAccess?: () => Promise<MidiAccessLike> }).requestMIDIAccess
+    if (!requestMidi) { setStatus('Web MIDI is not available here. You can still use your computer keyboard or mouse.'); return }
+    try {
+      setConnecting(true); setStatus('Waiting for MIDI permission…')
+      const access = await requestMidi.call(navigator)
+      setStatus(access.inputs.size ? 'MIDI keyboard connected. Opening your studio…' : 'Permission granted. No keyboard found, but you can connect one later.')
+      window.setTimeout(onDone, 650)
+    } catch { setStatus('MIDI permission was not granted. You can try again or continue without it.'); setConnecting(false) }
+  }
+  return <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, color: '#f2f2f2', background: '#121212', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', position: 'relative' }}>
+    <section style={{ textAlign: 'center', maxWidth: 420 }}><div style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', margin: '0 auto 22px', border: '1px solid #666', borderRadius: 8, fontSize: 22 }}>♫</div><p style={{ margin: 0, color: '#aaa', fontSize: 12, fontWeight: 700, letterSpacing: '.16em' }}>PIANO TUTOR</p><h1 style={{ margin: '10px 0', fontSize: 31 }}>Connect your piano</h1><p style={{ margin: '0 auto 24px', color: '#b9b9b9', lineHeight: 1.55, fontSize: 14 }}>{status}</p><button onClick={connect} disabled={connecting} style={{ ...buttonStyle, background: '#f1f1f1', color: '#111', borderColor: '#fff', opacity: connecting ? .65 : 1 }}>{connecting ? 'Connecting…' : 'Connect MIDI device'}</button></section>
+    <button onClick={onDone} style={{ position: 'absolute', left: 22, bottom: 20, background: 'transparent', color: '#9e9e9e', border: 0, fontSize: 13, cursor: 'pointer' }}>Skip for now</button>
   </main>
 }
 
@@ -421,7 +477,7 @@ function Dashboard({ account, onPractice, onSignOut }: { account: Account; onPra
   })
   const coaching = sessions.length ? `You completed ${sessions.length} recorded ${sessions.length === 1 ? 'session' : 'sessions'}. Your next gain is consistency: repeat a short phrase at a steady tempo before increasing speed.` : 'Start with a short, slow recording. Your first session gives the coach a baseline for timing and consistency.'
   return <main style={{ minHeight: '100vh', color: '#f0ece5', background: '#161616', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', padding: '28px 20px 48px' }}><div style={{ maxWidth: 1120, margin: '0 auto' }}>
-    <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 31, flexWrap: 'wrap' }}><div><p style={{ color: '#c5a36a', fontSize: 12, margin: 0, fontWeight: 700, letterSpacing: '.14em', fontFamily: 'Arial, sans-serif' }}>YOUR LEARNING STUDIO</p><h1 style={{ fontSize: 30, margin: '8px 0 0' }}>Mirë se erdhe, {account.name}.</h1></div><div style={{ display: 'flex', gap: 9 }}><button onClick={onSignOut} style={buttonStyle}>{account.guest ? 'Sign in to save' : 'Sign out'}</button><button onClick={onPractice} style={{ ...buttonStyle, background: '#6f5c3e' }}>Open piano →</button></div></header>
+    <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 31, flexWrap: 'wrap' }}><div><p style={{ color: '#c5a36a', fontSize: 12, margin: 0, fontWeight: 700, letterSpacing: '.14em', fontFamily: 'Arial, sans-serif' }}>YOUR LEARNING STUDIO</p><h1 style={{ fontSize: 30, margin: '8px 0 0' }}>Welcome, {account.name}.</h1></div><div style={{ display: 'flex', gap: 9 }}><button onClick={onSignOut} style={buttonStyle}>{account.guest ? 'Sign in to save' : 'Sign out'}</button><button onClick={onPractice} style={{ ...buttonStyle, background: '#6f5c3e' }}>Open piano →</button></div></header>
     {account.guest && <div style={{ ...panelStyle, marginBottom: 18, padding: '12px 16px', borderColor: '#7a6748', color: '#dfcfad', fontFamily: 'Arial, sans-serif', fontSize: 13 }}>You’re trying Piano Tutor as a guest. Your recordings and progress will disappear when you leave — sign in or create an account to save them.</div>}
     <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 18 }}><Stat label="Current level" value={`Level ${level}`} detail={`${account.xp} XP total`} /><Stat label="Practice time" value={`${minutes.toFixed(1)} min`} detail="Recorded practice" /><Stat label="Notes played" value={String(notes)} detail="Across all sessions" /><Stat label="Daily streak" value={`${account.streak} days`} detail="Record today to grow it" /></section>
     <section style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.45fr) minmax(280px, .85fr)', gap: 18 }}>

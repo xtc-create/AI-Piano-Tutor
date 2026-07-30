@@ -3,12 +3,13 @@ export async function POST(request: Request) {
   if (!apiKey) return Response.json({ error: 'Set GEMINI_API_KEY on the server to enable AI feedback.' }, { status: 503 })
 
   try {
-    const body = await request.json() as { piece?: unknown; lessonFeedback?: unknown }
+    const body = await request.json() as { piece?: unknown; lessonFeedback?: unknown; lessonResult?: unknown }
     const piece = typeof body.piece === 'string' ? body.piece.slice(0, 120) : 'a piano lesson'
     const timing = typeof body.lessonFeedback === 'string' ? body.lessonFeedback.slice(0, 800) : ''
     if (!timing) return Response.json({ error: 'Missing timing feedback.' }, { status: 400 })
 
-    const prompt = `You are a concise, encouraging piano teacher. Give 2-4 sentences of concrete practice advice for ${piece}. Use this measured timing result: ${timing}. Do not invent accuracy, dynamics, or technique data that was not measured. Focus on timing and the next small exercise.`
+    const result = typeof body.lessonResult === 'object' && body.lessonResult ? JSON.stringify(body.lessonResult).slice(0, 300) : ''
+    const prompt = `You are a concise, encouraging piano teacher. Give 2-4 sentences of concrete practice advice for ${piece}. Use these measured lesson results: ${timing} ${result}. Explain what the timing percentage/late notes mean in plain language. Do not invent accuracy, dynamics, or technique data that was not measured. Focus on timing and the next small exercise.`
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${encodeURIComponent(apiKey)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
